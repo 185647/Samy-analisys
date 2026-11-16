@@ -23,6 +23,9 @@ input bool   InpSignalOnly      = false;     // Signals only (no orders)
 input ulong  InpMagic           = 26111601;  // Magic number
 input bool   InpAlerts          = true;      // Popup alerts
 input bool   InpPush            = false;     // Push notifications to phone
+input bool   InpTelegram        = false;     // Send messages to Telegram
+input string InpTgToken         = "";        // Telegram bot token (from @BotFather)
+input string InpTgChatId        = "";        // Telegram chat id
 
 input group "Entry / exit"
 input int    InpEntryChannel    = 20;        // Donchian breakout lookback (bars)
@@ -48,6 +51,8 @@ input int    InpSlippagePoints  = 30;        // Max slippage (points)
 
 //--- globals
 CTrade   trade;
+#define  EA_NAME "GoldTrendFollower"
+string   gCloseReason = "";
 int      hEma = INVALID_HANDLE;
 int      hAtr = INVALID_HANDLE;
 datetime gLastBar      = 0;
@@ -83,6 +88,9 @@ int OnInit()
    trade.SetTypeFillingBySymbol(_Symbol);
    if(_Period != PERIOD_H4)
       Print("Note: GoldTrendFollower was designed for H4. Current timeframe: ", EnumToString(_Period));
+   if(InpTelegram && !MQLInfoInteger(MQL_TESTER))
+      SendTelegram(AccountTag() + " " + EA_NAME + " started on " + _Symbol + " " + EnumToString(_Period) +
+                   (InpSignalOnly ? " (signals only)" : " (auto trading)"));
    return(INIT_SUCCEEDED);
   }
 
@@ -96,6 +104,92 @@ void OnDeinit(const int reason)
   }
 
 //+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| Telegram                                                         |
+//| MT5: Tools > Options > Expert Advisors > Allow WebRequest for    |
+//| listed URL > add https://api.telegram.org                        |
+//+------------------------------------------------------------------+
+string UrlEncode(const string s)
+  {
+   uchar bytes[];
+   int n = StringToCharArray(s, bytes, 0, WHOLE_ARRAY, CP_UTF8);
+   string out = "";
+   for(int i = 0; i < n - 1; i++)
+     {
+      uchar c = bytes[i];
+      if((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+         c == '-' || c == '_' || c == '.' || c == '~')
+         out += CharToString(c);
+      else
+         out += StringFormat("%%%02X", c);
+     }
+   return(out);
+  }
+
+bool SendTelegram(const string text)
+  {
+   if(!InpTelegram || InpTgToken == "" || InpTgChatId == "")
+      return(false);
+   if(MQLInfoInteger(MQL_TESTER) || MQLInfoInteger(MQL_OPTIMIZATION))
+      return(false);
+   string url  = "https://api.telegram.org/bot" + InpTgToken + "/sendMessage";
+   string body = "chat_id=" + InpTgChatId + "&text=" + UrlEncode(text);
+   char data[];
+   char result[];
+   string resHeaders;
+   int len = StringToCharArray(body, data, 0, WHOLE_ARRAY, CP_UTF8);
+   if(len > 0)
+      ArrayResize(data, len - 1);          // drop terminating zero
+   string headers = "Content-Type: application/x-www-form-urlencoded\r\n";
+   ResetLastError();
+   int code = WebRequest("POST", url, headers, 5000, data, result, resHeaders);
+   if(code == -1)
+     {
+      PrintFormat("Telegram failed (error %d). Add https://api.telegram.org in Tools > Options > Expert Advisors > Allow WebRequest.", GetLastError());
+      return(false);
+     }
+   if(code != 200)
+      PrintFormat("Telegram HTTP %d: %s", code, CharArrayToString(result, 0, WHOLE_ARRAY, CP_UTF8));
+   return(code == 200);
+  }
+
+string AccountTag()
+  {
+   string kind = (AccountInfoInteger(ACCOUNT_TRADE_MODE) == ACCOUNT_TRADE_MODE_DEMO) ? "DEMO" : "REAL";
+   return(StringFormat("[%s %I64d]", kind, AccountInfoInteger(ACCOUNT_LOGIN)));
+  }
+
+//+------------------------------------------------------------------+
+//| Report every closed position (SL / TP / EA exit) with P/L        |
+//+------------------------------------------------------------------+
+void OnTradeTransaction(const MqlTradeTransaction &trans, const MqlTradeRequest &request, const MqlTradeResult &result)
+  {
+   if(trans.type != TRADE_TRANSACTION_DEAL_ADD)
+      return;
+   if(!HistoryDealSelect(trans.deal))
+      return;
+   if(HistoryDealGetInteger(trans.deal, DEAL_MAGIC) != (long)InpMagic)
+      return;
+   if(HistoryDealGetString(trans.deal, DEAL_SYMBOL) != _Symbol)
+      return;
+   long entry = HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
+   if(entry != DEAL_ENTRY_OUT && entry != DEAL_ENTRY_OUT_BY)
+      return;
+   double pnl = HistoryDealGetDouble(trans.deal, DEAL_PROFIT)
+                + HistoryDealGetDouble(trans.deal, DEAL_SWAP)
+                + HistoryDealGetDouble(trans.deal, DEAL_COMMISSION);
+   long reason = HistoryDealGetInteger(trans.deal, DEAL_REASON);
+   string why = gCloseReason;
+   if(reason == DEAL_REASON_SL)      why = "stop loss";
+   else if(reason == DEAL_REASON_TP) why = "take profit";
+   else if(reason == DEAL_REASON_SO) why = "stop out";
+   else if(why == "")                why = "manual/other";
+   gCloseReason = "";
+   Notify(StringFormat("%s %s: position CLOSED @ %.2f (%s)  P/L %.2f %s",
+                       _Symbol, EA_NAME, HistoryDealGetDouble(trans.deal, DEAL_PRICE), why, pnl,
+                       AccountInfoString(ACCOUNT_CURRENCY)));
+  }
+
 void Notify(const string msg)
   {
    Print(msg);
@@ -105,6 +199,7 @@ void Notify(const string msg)
       Alert(msg);
    if(InpPush && TerminalInfoInteger(TERMINAL_NOTIFICATIONS_ENABLED))
       SendNotification(msg);
+   SendTelegram(AccountTag() + " " + msg);
   }
 
 //+------------------------------------------------------------------+
@@ -245,8 +340,9 @@ void ManagePositions(const double close1, const double atr, const double exitLow
         {
          if(close1 < exitLow)
            {
-            if(trade.PositionClose(tk))
-               Notify(StringFormat("%s GoldTrendFollower: EXIT LONG (close %.2f < %d-bar low %.2f)", _Symbol, close1, InpExitChannel, exitLow));
+            gCloseReason = StringFormat("exit: close below %d-bar low %.2f", InpExitChannel, exitLow);
+            if(!trade.PositionClose(tk))
+               gCloseReason = "";
             continue;
            }
          if(InpTrailStopATR > 0.0)
@@ -265,8 +361,9 @@ void ManagePositions(const double close1, const double atr, const double exitLow
            {
             if(close1 > exitHigh)
               {
-               if(trade.PositionClose(tk))
-                  Notify(StringFormat("%s GoldTrendFollower: EXIT SHORT (close %.2f > %d-bar high %.2f)", _Symbol, close1, InpExitChannel, exitHigh));
+               gCloseReason = StringFormat("exit: close above %d-bar high %.2f", InpExitChannel, exitHigh);
+               if(!trade.PositionClose(tk))
+                  gCloseReason = "";
                continue;
               }
             if(InpTrailStopATR > 0.0)
